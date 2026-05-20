@@ -1,5 +1,15 @@
 # Function app — local dev
 
+```mermaid
+flowchart TD
+  A[Create local.settings.json from sample] --> B[Login with az login]
+  B --> C[Start host with func start]
+  C --> D[Upload JSON to source/<usecase>/<analyzer>/<file>.json]
+  D --> E{Processing result}
+  E -->|Success| F[Blob moves to processed/...]
+  E -->|Failure| G[Blob moves to failed/... + .error.txt]
+```
+
 ## Prerequisites
 
 - Python 3.11 (the deployed app uses 3.11 — match locally to avoid surprises)
@@ -24,6 +34,9 @@ func start
 Drop a JSON file into `<storage>/source/<usecase>/<analyzer>/<file>.json`
 and watch the logs. After ingestion, the file lands in
 `<storage>/processed/<usecase>/<analyzer>/<file>.json` (or `failed/...` on error).
+
+Important: the blob path must include both `<usecase>` and `<analyzer>`. A flat path like
+`source/file.json` is ignored by design.
 
 ## How it's wired
 

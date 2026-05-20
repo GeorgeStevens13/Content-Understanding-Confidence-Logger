@@ -4,6 +4,26 @@
 needed once to (1) grant the Function's Managed Identity access and (2) create
 the schema. They use the Entra admin set on the SQL server (your account).
 
+```mermaid
+flowchart TD
+   A[Connect to SQL DB as Entra admin] --> B[Create MI user in SQL]
+   B --> C[Grant db_datareader + db_datawriter]
+   C --> D[Grant EXECUTE on schema cu]
+   D --> E[Run 01_schema.sql]
+   E --> F[Run 02_views.sql]
+   F --> G[Validate with test upload and check cu views]
+```
+
+## Network requirement
+
+Current deployment expects the Function App to reach SQL over public endpoint.
+For this architecture to work, ensure:
+
+- SQL server `publicNetworkAccess` is `Enabled`
+- Firewall rule `AllowAzureServices` (`0.0.0.0` to `0.0.0.0`) exists
+
+If you want SQL public access disabled, move to private networking (Function VNet integration + SQL private endpoint).
+
 ## 1. Grant the Function's Managed Identity access
 
 The Function App's system-assigned Managed Identity needs `db_datareader` +

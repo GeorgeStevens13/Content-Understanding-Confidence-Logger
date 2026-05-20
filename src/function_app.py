@@ -55,19 +55,15 @@ def ingest_content_understanding_json(blob: func.InputStream) -> None:
     """Process one blob. Bindings inject usecase/analyzer/name from the path."""
 
     full_name = blob.name or ""                 # e.g. "source/invoices/contoso/foo.json"
-    # Strip leading "<container>/" → "<usecase>/<analyzer>/<file>"
-    relative = full_name.split("/", 1)[1] if "/" in full_name else full_name
-    parts = relative.split("/")
-
-    # Defensive: only handle exactly <usecase>/<analyzer>/<file>.json
-    if len(parts) != 3 or not parts[2].lower().endswith(".json"):
+    parsed = _parse_relative_blob_path(full_name)
+    if parsed is None:
         log.warning(
             "Skipping blob %s — expected layout <usecase>/<analyzer>/<file>.json",
             full_name,
         )
         return
 
-    usecase, analyzer_name, file_name = parts
+    relative, usecase, analyzer_name, file_name = parsed
     log.info(
         "Ingesting blob: usecase=%s analyzer=%s file=%s bytes=%s",
         usecase, analyzer_name, file_name, blob.length,
@@ -77,7 +73,7 @@ def ingest_content_understanding_json(blob: func.InputStream) -> None:
         payload = json.loads(blob.read().decode("utf-8"))
     except Exception as exc:
         _handle_failure(
-            relative=relative, file_name=file_name,
+            relative=relative,
             usecase=usecase, analyzer_name=analyzer_name,
             kind="ParseError", err=exc,
         )
@@ -90,7 +86,7 @@ def ingest_content_understanding_json(blob: func.InputStream) -> None:
         )
     except Exception as exc:
         _handle_failure(
-            relative=relative, file_name=file_name,
+            relative=relative,
             usecase=usecase, analyzer_name=analyzer_name,
             kind="SchemaError", err=exc,
         )
@@ -110,7 +106,7 @@ def ingest_content_understanding_json(blob: func.InputStream) -> None:
             document_ids.append(doc_id)
     except Exception as exc:
         _handle_failure(
-            relative=relative, file_name=file_name,
+            relative=relative,
             usecase=usecase, analyzer_name=analyzer_name,
             kind="SqlError", err=exc,
         )
@@ -153,10 +149,18 @@ def ingest_content_understanding_json(blob: func.InputStream) -> None:
 # Failure path: move to FAILED container with .error.txt
 # ---------------------------------------------------------------------------
 
+def _parse_relative_blob_path(full_name: str) -> tuple[str, str, str, str] | None:
+    # Strip leading "<container>/" → "<usecase>/<analyzer>/<file>".
+    relative = full_name.split("/", 1)[1] if "/" in full_name else full_name
+    parts = relative.split("/")
+    if len(parts) != 3 or not parts[2].lower().endswith(".json"):
+        return None
+    usecase, analyzer_name, file_name = parts
+    return relative, usecase, analyzer_name, file_name
+
 def _handle_failure(
     *,
     relative: str,
-    file_name: str,
     usecase: str,
     analyzer_name: str,
     kind: str,

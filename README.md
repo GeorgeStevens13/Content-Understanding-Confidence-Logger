@@ -4,18 +4,13 @@ Ingest Azure AI **Content Understanding** label/extraction JSON into **Azure SQL
 extracted field (and its confidence score) is queryable and reportable from **Power BI**.
 Originals are moved from a `source` container to `processed` (or `failed`) once handled.
 
-```
-Storage (source/<usecase>/<analyzer>/file.json)
-        │  Blob trigger
-        ▼
-Azure Function (Python, Managed Identity)
-        │  parse JSON, EAV insert
-        ▼
-Azure SQL  ◄── Power BI (Import / DirectQuery via vw_DocumentFields)
-        │
-        ▼
-Storage (processed/<usecase>/<analyzer>/file.json)
-       or  (failed/<usecase>/<analyzer>/file.json + .error.txt)
+```mermaid
+flowchart LR
+    A[Blob Storage: source/<usecase>/<analyzer>/<file>.json] -->|Blob trigger| B[Azure Function App\nPython + Managed Identity]
+    B -->|Parse + flatten fields| C[(Azure SQL: cu.Documents + cu.DocumentFields)]
+    C --> D[Power BI\nReports on cu views]
+    B -->|On success| E[Blob Storage: processed/<usecase>/<analyzer>/<file>.json]
+    B -->|On failure| F[Blob Storage: failed/<usecase>/<analyzer>/<file>.json + .error.txt]
 ```
 
 ## What gets stored
@@ -24,8 +19,8 @@ For every JSON file ingested:
 
 | Table              | Purpose                                                                 |
 | ------------------ | ----------------------------------------------------------------------- |
-| `dbo.Documents`    | One row per document — usecase, analyzer, filename, blob path, mime, …  |
-| `dbo.DocumentFields` | One row per extracted field — field name, value, **confidence**, spans |
+| `cu.Documents`     | One row per document — usecase, analyzer, filename, blob path, mime, …  |
+| `cu.DocumentFields` | One row per extracted field — field name, value, **confidence**, spans |
 
 Re-ingesting the same blob path **upserts** (replaces) — safe to replay.
 
@@ -50,10 +45,10 @@ authenticate (Microsoft account / Entra ID). Pick from these views:
 
 | View                       | Use                                                            |
 | -------------------------- | -------------------------------------------------------------- |
-| `dbo.vw_DocumentFields`    | Flat fact table — one row per field. Main reporting surface.   |
-| `dbo.vw_DocumentSummary`   | One row per document — avg/min/max confidence, field count.    |
-| `dbo.vw_LowConfidenceFields`| Fields below 0.7 — review queue.                              |
-| `dbo.vw_FieldStatsByAnalyzer` | Per-analyzer / per-field-name confidence stats over time.    |
+| `cu.vw_DocumentFields`    | Flat fact table — one row per field. Main reporting surface.   |
+| `cu.vw_DocumentSummary`   | One row per document — avg/min/max confidence, field count.    |
+| `cu.vw_LowConfidenceFields`| Fields below 0.7 — review queue.                              |
+| `cu.vw_FieldStatsByAnalyzer` | Per-analyzer / per-field-name confidence stats over time.    |
 
 ## Deploy
 
@@ -122,6 +117,18 @@ After that, drop a JSON file into:
 
 and it will appear in `cu.Documents` + `cu.DocumentFields` within seconds, and
 move to `<storage>/processed/<usecase>/<analyzer>/<file>.json`.
+
+## Manual test checklist
+
+Use this sequence to validate a new deployment quickly:
+
+1. Upload a valid CU JSON file to `source/<usecase>/<analyzer>/<file>.json`.
+2. Wait 5-30 seconds.
+3. Confirm success path: blob moved to `processed/<usecase>/<analyzer>/<file>.json`.
+4. Confirm failure path (if triggered): blob moved to `failed/<usecase>/<analyzer>/<file>.json` and `failed/<usecase>/<analyzer>/<file>.json.error.txt` exists.
+5. Validate SQL rows in `cu.Documents` and `cu.DocumentFields`.
+
+Common pitfall: uploading to `source/<file>.json` (missing `<usecase>/<analyzer>`) will not trigger ingestion.
 
 ## Local dev
 

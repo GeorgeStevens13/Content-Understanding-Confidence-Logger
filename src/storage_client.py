@@ -91,7 +91,10 @@ def move_blob(
                 f"Copy failed (status={status}): {props.copy.status_description}"
             )
         if time.monotonic() > deadline:
-            raise TimeoutError(f"Copy to {destination_container}/{dest_blob_name} did not complete in {max_wait_sec}s")
+            raise TimeoutError(
+                f"Copy to {destination_container}/{dest_blob_name} did not "
+                f"complete in {max_wait_sec}s"
+            )
         time.sleep(poll_interval_sec)
 
     src_client.delete_blob()

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "sqlAdminObjectId": {
+      "value": "${AZURE_PRINCIPAL_ID}"
+    },
+    "sqlAdminLogin": {
+      "value": "${AZURE_PRINCIPAL_NAME=}"
+    },
+    "sqlAdminPrincipalType": {
+      "value": "${SQL_ADMIN_PRINCIPAL_TYPE=User}"
+    },
+    "sqlDatabaseName": {
+      "value": "${SQL_DATABASE_NAME=cu_confidence}"
+    },
+    "sqlDatabaseSku": {
+      "value": "${SQL_DATABASE_SKU=S0}"
+    }
+  }
+}

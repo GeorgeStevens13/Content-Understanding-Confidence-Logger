@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: cu-confidence-logger
+metadata:
+  template: cu-confidence-logger@1.0.0
+
+services:
+  ingest:
+    project: ./src
+    language: python
+    host: function

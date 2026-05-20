@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.python_packages/
+.pytest_cache/
+
+# Functions
+local.settings.json
+bin/
+obj/
+.azurefunctions/
+
+# Editor
+.vscode/*
+!.vscode/settings.json
+
+# azd
+.azure/
+.azd/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

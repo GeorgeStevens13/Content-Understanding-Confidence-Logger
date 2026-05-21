@@ -130,6 +130,96 @@ Use this sequence to validate a new deployment quickly:
 
 Common pitfall: uploading to `source/<file>.json` (missing `<usecase>/<analyzer>`) will not trigger ingestion.
 
+### Known-good one-shot E2E (WSL/Azure CLI)
+
+This is a copy/paste flow that was validated end-to-end with the production
+analyze-result shape (`result.contents`):
+
+```bash
+# from repo root
+set -e
+set -a && . .azure/dev/.env && set +a
+
+# 1) Start local host (identity-based) in a separate terminal
+cat > src/local.settings.json <<EOF
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsFeatureFlags": "EnableWorkerIndexing",
+    "AzureWebJobsStorage__accountName": "$STORAGE_ACCOUNT_NAME",
+    "AzureWebJobsStorage__blobServiceUri": "https://$STORAGE_ACCOUNT_NAME.blob.core.windows.net/",
+    "AzureWebJobsStorage__queueServiceUri": "https://$STORAGE_ACCOUNT_NAME.queue.core.windows.net/",
+    "AzureWebJobsStorage__tableServiceUri": "https://$STORAGE_ACCOUNT_NAME.table.core.windows.net/",
+    "AzureWebJobsStorage__credential": "AzureCli",
+    "SOURCE_CONTAINER": "source",
+    "PROCESSED_CONTAINER": "processed",
+    "FAILED_CONTAINER": "failed",
+    "SQL_SERVER": "$SQL_SERVER",
+    "SQL_DATABASE": "$SQL_DATABASE",
+    "LOW_CONFIDENCE_THRESHOLD": "0.70"
+  }
+}
+EOF
+# terminal B:
+#   cd src && func start
+
+# 2) Upload probe JSON (production analyze-result shape)
+TS=$(date +%Y%m%d%H%M%S)
+BLOB="e2e/local/cu-e2e-analyze-$TS.json"
+cat > /tmp/cu-e2e-analyze-$TS.json <<EOF
+{
+  "id": "op-$TS",
+  "status": "succeeded",
+  "result": {
+    "analyzerId": "invoice-analyzer-v1",
+    "apiVersion": "2024-11-30",
+    "createdAt": "2026-05-20T11:08:00Z",
+    "contents": [
+      {
+        "path": "input1",
+        "fields": {
+          "InvoiceId": {"type": "string", "valueString": "A-100", "confidence": 0.99},
+          "Total": {"type": "number", "valueNumber": 123.45, "confidence": 0.97}
+        }
+      }
+    ]
+  }
+}
+EOF
+az storage blob upload --auth-mode login --account-name "$STORAGE_ACCOUNT_NAME" \
+  -c source -n "$BLOB" -f /tmp/cu-e2e-analyze-$TS.json --overwrite -o none
+echo "Uploaded: source/$BLOB"
+
+# 3) Verify storage movement
+SRC_EXISTS=$(az storage blob exists --auth-mode login --account-name "$STORAGE_ACCOUNT_NAME" -c source -n "$BLOB" --query exists -o tsv)
+PROCESSED_EXISTS=$(az storage blob exists --auth-mode login --account-name "$STORAGE_ACCOUNT_NAME" -c processed -n "$BLOB" --query exists -o tsv)
+FAILED_EXISTS=$(az storage blob exists --auth-mode login --account-name "$STORAGE_ACCOUNT_NAME" -c failed -n "$BLOB" --query exists -o tsv)
+echo "source=$SRC_EXISTS"
+echo "processed=$PROCESSED_EXISTS"
+echo "failed=$FAILED_EXISTS"
+
+# 4) Verify SQL rows
+sqlcmd -S "tcp:$SQL_SERVER,1433" -d "$SQL_DATABASE" -G -N -Q "
+SET NOCOUNT ON;
+SELECT TOP 1 d.document_id, d.usecase, d.analyzer_name, d.content_path, d.field_count, d.ingested_at
+FROM cu.Documents d
+WHERE d.blob_path = 'source/$BLOB'
+ORDER BY d.ingested_at DESC;
+
+SELECT COUNT(*) AS field_rows
+FROM cu.DocumentFields f
+INNER JOIN cu.Documents d ON d.document_id = f.document_id
+WHERE d.blob_path = 'source/$BLOB';"
+```
+
+Expected outcome:
+
+- `source=false`
+- `processed=true`
+- `failed=false`
+- one `cu.Documents` row for `source/$BLOB` and `field_rows > 0`
+
 ## Local dev
 
 See [src/README.md](src/README.md).

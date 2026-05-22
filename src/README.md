@@ -2,12 +2,14 @@
 
 ```mermaid
 flowchart TD
-  A[Create local.settings.json from sample] --> B[Login with az login]
-  B --> C[Start host with func start]
-  C --> D[Upload JSON to source/<usecase>/<analyzer>/<file>.json]
-  D --> E{Processing result}
-  E -->|Success| F[Blob moves to processed/...]
-  E -->|Failure| G[Blob moves to failed/... + .error.txt]
+  A["Create local.settings.json from sample"] --> B["az login"]
+  B --> C["cd src && func start"]
+  C --> D["Upload one or more JSON files to<br/>source/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json"]
+  D --> E["Wait for the next timer tick<br/>(INGEST_SCHEDULE, default 15 min)"]
+  E --> L["Batch loop: up to BATCH_MAX_FILES blobs<br/>each under a 60s lease"]
+  L --> F{Per-file result}
+  F -->|Success| G["Blob moves to processed/…<br/>row in cu.Documents + cu.DocumentFields"]
+  F -->|Failure| H["Blob moves to failed/…<br/>+ .error.txt sidecar<br/>+ row in cu.IngestionErrors"]
 ```
 
 ## Prerequisites
@@ -31,23 +33,28 @@ az login                       # so DefaultAzureCredential can get tokens
 func start
 ```
 
-Drop a JSON file into `<storage>/source/<usecase>/<analyzer>/<file>.json`
-and watch the logs. After ingestion, the file lands in
-`<storage>/processed/<usecase>/<analyzer>/<file>.json` (or `failed/...` on error).
+Drop one or more JSON files into
+`<storage>/source/<usecase>/<analyzer>/<file>.json` and watch the logs. The
+batch trigger runs on `INGEST_SCHEDULE` (default `0 */15 * * * *`); locally
+you'll probably want a tighter schedule — set `INGEST_SCHEDULE` to
+`*/30 * * * * *` in `local.settings.json` so it ticks every 30 seconds. After
+ingestion, files land in `<storage>/processed/<usecase>/<analyzer>/<file>.json`
+(or `failed/...` on error).
 
 Important: the blob path must include both `<usecase>` and `<analyzer>`. A flat path like
-`source/file.json` is ignored by design.
+`source/file.json` is silently skipped — the batch only picks up blobs that
+match the three-segment layout.
 
 ## How it's wired
 
-| File                | Purpose                                                            |
-| ------------------- | ------------------------------------------------------------------ |
-| `function_app.py`   | Blob trigger entry point + failure handling                        |
-| `ingestion.py`      | Parses both CU formats and flattens leaves into rows               |
-| `sql_client.py`     | Managed Identity → pyodbc connection; document + field writes      |
-| `storage_client.py` | Server-side copy + delete (= move)                                 |
-| `host.json`         | Functions host config (extension bundle, sampling)                 |
-| `requirements.txt`  | Python dependencies                                                |
+| File                | Purpose                                                                       |
+| ------------------- | ----------------------------------------------------------------------------- |
+| `function_app.py`   | Timer trigger + batch loop + failure handling + per-blob lease orchestration  |
+| `ingestion.py`      | Parses both CU formats and flattens leaves into rows                          |
+| `sql_client.py`     | Managed Identity → pyodbc connection; document + field writes; error logging |
+| `storage_client.py` | List blobs + acquire short lease + server-side copy + delete (= move)         |
+| `host.json`         | Functions host config (extension bundle, sampling, 10-min timeout)            |
+| `requirements.txt`  | Python dependencies                                                           |
 
 ## Adding a new field type
 

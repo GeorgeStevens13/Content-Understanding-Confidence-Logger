@@ -6,23 +6,51 @@ the schema. They use the Entra admin set on the SQL server (your account).
 
 ```mermaid
 flowchart TD
-   A[Connect to SQL DB as Entra admin] --> B[Create MI user in SQL]
-   B --> C[Grant db_datareader + db_datawriter]
-   C --> D[Grant EXECUTE on schema cu]
-   D --> E[Run 01_schema.sql]
-   E --> F[Run 02_views.sql]
-   F --> G[Validate with test upload and check cu views]
+   A["Connect to SQL DB<br/>as Entra admin"] --> B["CREATE USER for Function MI"]
+   B --> C["Grant db_datareader + db_datawriter"]
+   C --> D["GRANT EXECUTE ON SCHEMA::cu"]
+   D --> E["Run 01_schema.sql<br/>(tables + usp_UpsertDocument + usp_FinalizeDocument + log_error)"]
+   E --> F["Run 02_views.sql<br/>(5 Power BI views)"]
+   F --> G["Validate: upload one JSON,<br/>check cu.Documents / cu.DocumentFields"]
 ```
 
 ## Network requirement
 
-Current deployment expects the Function App to reach SQL over public endpoint.
+Current deployment expects the Function App to reach SQL over the public endpoint.
 For this architecture to work, ensure:
 
 - SQL server `publicNetworkAccess` is `Enabled`
-- Firewall rule `AllowAzureServices` (`0.0.0.0` to `0.0.0.0`) exists
+- Firewall rule `AllowAzureServices` (`0.0.0.0` → `0.0.0.0`) exists
 
-If you want SQL public access disabled, move to private networking (Function VNet integration + SQL private endpoint).
+If you want SQL public access disabled, move to private networking (Function VNet
+integration + SQL private endpoint).
+
+### Symptom of misconfiguration
+
+Every blob in a batch ends up in `failed/` with an `.error.txt` sidecar and a
+matching row in `cu.IngestionErrors` whose `error_message` contains:
+
+```
+pyodbc.ProgrammingError ... (47073) ... "Connection was denied because Deny Public Network Access is set to Yes"
+```
+
+Fix — re-enable public access and (re)add the Azure-services firewall rule:
+
+```bash
+RG=rg-dev
+SQL=sql-cuc-dev-xxxxxxxx
+az sql server update -g $RG -n $SQL --enable-public-network true
+az sql server firewall-rule create -g $RG -s $SQL -n AllowAzureServices \
+  --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+```
+
+Then re-stage the failed blobs back into `source/` (or upload fresh copies) and
+trigger the function again. The batch is idempotent — re-ingesting the same
+`(blob_path, content_path)` upserts via `cu.usp_UpsertDocument`.
+
+Note: in policy-governed subscriptions, `publicNetworkAccess` can drift back to
+`Disabled` after a policy remediation run. If failures recur, check the SQL
+server state first.
 
 ## 1. Grant the Function's Managed Identity access
 
@@ -62,3 +90,17 @@ Both scripts are idempotent — safe to re-run after changes.
    - `cu.vw_LowConfidenceFields` — review queue
    - `cu.vw_FieldStatsByAnalyzer` — field/analyzer trending
    - `cu.vw_DailyIngestion` — daily volume + quality
+
+## 4. Inspecting ingestion failures
+
+Every failure also writes an `.error.txt` sibling next to the blob in the
+`failed` container. The same information is queryable from SQL:
+
+```sql
+SELECT TOP 20 occurred_at, error_kind, blob_path,
+              usecase, analyzer_name, LEFT(error_message, 200) AS error_message
+FROM cu.IngestionErrors
+ORDER BY occurred_at DESC;
+```
+
+`error_kind` values: `ParseError`, `SqlError`, `MoveError`.

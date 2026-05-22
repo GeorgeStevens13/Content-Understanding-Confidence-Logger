@@ -4,13 +4,19 @@ Ingest Azure AI **Content Understanding** label/extraction JSON into **Azure SQL
 extracted field (and its confidence score) is queryable and reportable from **Power BI**.
 Originals are moved from a `source` container to `processed` (or `failed`) once handled.
 
+Processing is **timer-driven**: every 15 minutes (configurable via `INGEST_SCHEDULE`)
+the Function App scans the `source` container and processes up to `BATCH_MAX_FILES`
+blobs in a single batch.
+
 ```mermaid
 flowchart LR
-    A[Blob Storage: source/<usecase>/<analyzer>/<file>.json] -->|Blob trigger| B[Azure Function App\nPython + Managed Identity]
-    B -->|Parse + flatten fields| C[(Azure SQL: cu.Documents + cu.DocumentFields)]
-    C --> D[Power BI\nReports on cu views]
-    B -->|On success| E[Blob Storage: processed/<usecase>/<analyzer>/<file>.json]
-    B -->|On failure| F[Blob Storage: failed/<usecase>/<analyzer>/<file>.json + .error.txt]
+    T["Timer<br/>(INGEST_SCHEDULE, default every 15 min UTC)"] --> B
+    A["Blob Storage<br/>source/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json"] -->|List + 60s lease| B
+    B["Azure Function App<br/>Python 3.11 · Managed Identity<br/>batch up to BATCH_MAX_FILES per tick"]
+    B -->|Parse + flatten fields<br/>upsert via cu.usp_UpsertDocument| C[("Azure SQL<br/>cu.Documents · cu.DocumentFields")]
+    C --> D["Power BI<br/>cu.vw_* views"]
+    B -->|On success| E["processed/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json"]
+    B -->|On failure| F["failed/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json<br/>+ .error.txt sidecar<br/>+ row in cu.IngestionErrors"]
 ```
 
 ## What gets stored
@@ -43,12 +49,13 @@ otherwise the filename is used.
 Connect Power BI Desktop → **Azure SQL Database** → enter the server name & DB →
 authenticate (Microsoft account / Entra ID). Pick from these views:
 
-| View                       | Use                                                            |
-| -------------------------- | -------------------------------------------------------------- |
-| `cu.vw_DocumentFields`    | Flat fact table — one row per field. Main reporting surface.   |
-| `cu.vw_DocumentSummary`   | One row per document — avg/min/max confidence, field count.    |
-| `cu.vw_LowConfidenceFields`| Fields below 0.7 — review queue.                              |
-| `cu.vw_FieldStatsByAnalyzer` | Per-analyzer / per-field-name confidence stats over time.    |
+| View                         | Use                                                            |
+| ---------------------------- | -------------------------------------------------------------- |
+| `cu.vw_DocumentFields`       | Flat fact table — one row per field. Main reporting surface.   |
+| `cu.vw_DocumentSummary`      | One row per document — avg/min/max confidence, field count.    |
+| `cu.vw_LowConfidenceFields`  | Fields below `LOW_CONFIDENCE_THRESHOLD` (default 0.7).         |
+| `cu.vw_FieldStatsByAnalyzer` | Per-analyzer / per-field-name confidence stats over time.      |
+| `cu.vw_DailyIngestion`       | Daily volume + average confidence + error count.               |
 
 ## Deploy
 
@@ -109,26 +116,77 @@ Two SQL steps are needed once (Azure can't fully automate Entra DB users via Bic
 
 Full T-SQL and instructions: [sql/README.md](sql/README.md).
 
-After that, drop a JSON file into:
+After that, drop one or more JSON files into:
 
 ```
 <storage>/source/<usecase>/<analyzer>/<file>.json
 ```
 
-and it will appear in `cu.Documents` + `cu.DocumentFields` within seconds, and
-move to `<storage>/processed/<usecase>/<analyzer>/<file>.json`.
+They will be picked up on the next 15-minute timer tick (or sooner if you set
+`INGEST_SCHEDULE` to a tighter NCRONTAB expression), inserted into
+`cu.Documents` + `cu.DocumentFields`, and moved to
+`<storage>/processed/<usecase>/<analyzer>/<file>.json`.
+
+### Ingest schedule
+
+| Setting                  | Default          | Notes                                                                                  |
+| ------------------------ | ---------------- | -------------------------------------------------------------------------------------- |
+| `INGEST_SCHEDULE`        | `0 */15 * * * *` | NCRONTAB (UTC). Top of the hour + every 15 min. Use `0 */5 * * * *` for 5-min cadence. |
+| `BATCH_MAX_FILES`        | `50`             | Max blobs processed per tick. Anything not consumed waits for the next tick.           |
+| `BATCH_TIME_BUDGET_SEC`  | `540`            | Soft cutoff (9 min) so the loop never bumps into the 10-min host timeout.              |
+
+Change them with `az functionapp config appsettings set` (no redeploy needed).
 
 ## Manual test checklist
 
 Use this sequence to validate a new deployment quickly:
 
-1. Upload a valid CU JSON file to `source/<usecase>/<analyzer>/<file>.json`.
-2. Wait 5-30 seconds.
-3. Confirm success path: blob moved to `processed/<usecase>/<analyzer>/<file>.json`.
-4. Confirm failure path (if triggered): blob moved to `failed/<usecase>/<analyzer>/<file>.json` and `failed/<usecase>/<analyzer>/<file>.json.error.txt` exists.
-5. Validate SQL rows in `cu.Documents` and `cu.DocumentFields`.
+1. Upload one or more valid CU JSON files to `source/<usecase>/<analyzer>/<file>.json`.
+2. Wait for the next timer tick (up to 15 minutes with the default schedule),
+   or invoke the function on demand. Two options:
 
-Common pitfall: uploading to `source/<file>.json` (missing `<usecase>/<analyzer>`) will not trigger ingestion.
+   **Option A — admin endpoint (fast path used in our E2E test):**
+   ```bash
+   FUNC=func-cuc-dev-xxxxxxxx
+   RG=rg-dev
+   MASTER_KEY=$(az functionapp keys list -g $RG -n $FUNC --query masterKey -o tsv)
+   curl -s -o /dev/null -w "%{http_code}\n" -X POST \
+     -H "x-functions-key: $MASTER_KEY" -H "Content-Type: application/json" \
+     -d '{"input":""}' \
+     "https://$FUNC.azurewebsites.net/admin/functions/ingest_content_understanding_batch"
+   # → 202 means accepted; the timer runs the batch loop asynchronously.
+   ```
+
+   **Option B — ARM `az rest`:**
+   ```bash
+   az rest --method post \
+     --uri "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/$FUNC/functions/ingest_content_understanding_batch/invoke?api-version=2024-04-01" \
+     --body '{}'
+   ```
+
+   Or temporarily tighten the schedule: `az functionapp config appsettings set -g $RG -n $FUNC --settings INGEST_SCHEDULE="*/30 * * * * *"` (every 30 s).
+
+3. Confirm success path: blobs moved to `processed/<usecase>/<analyzer>/<file>.json`.
+4. Confirm failure path (if triggered): blob moved to `failed/<usecase>/<analyzer>/<file>.json`, sidecar `failed/<usecase>/<analyzer>/<file>.json.error.txt` exists, **and** a row in `cu.IngestionErrors` is created.
+5. Validate SQL rows. The `blob_path` column stores the **source-relative** path, even after the blob is moved to `processed/`:
+   ```sql
+   SELECT document_id, usecase, analyzer_name, document_name, status,
+          field_count, avg_confidence, processed_blob_url, ingested_at
+   FROM cu.Documents
+   WHERE blob_path LIKE 'source/<usecase>/<analyzer>/%'
+   ORDER BY ingested_at DESC;
+
+   SELECT TOP 20 d.document_name, f.field_path, f.field_type,
+                 f.value_string, f.value_number, f.confidence
+   FROM cu.Documents d
+   JOIN cu.DocumentFields f ON f.document_id = d.document_id
+   WHERE d.blob_path LIKE 'source/<usecase>/<analyzer>/%'
+   ORDER BY d.document_id, f.field_path;
+   ```
+
+Common pitfalls:
+- Uploading to `source/<file>.json` (missing `<usecase>/<analyzer>`) is silently skipped — only blobs that match the three-segment layout are picked up.
+- All five failed files in one tick? Check `cu.IngestionErrors.error_message` first — the common cause is SQL `publicNetworkAccess` drifting back to `Disabled` (see [sql/README.md](sql/README.md#network-requirement)).
 
 ### Known-good one-shot E2E (WSL/Azure CLI)
 
@@ -157,12 +215,17 @@ cat > src/local.settings.json <<EOF
     "FAILED_CONTAINER": "failed",
     "SQL_SERVER": "$SQL_SERVER",
     "SQL_DATABASE": "$SQL_DATABASE",
-    "LOW_CONFIDENCE_THRESHOLD": "0.70"
+    "LOW_CONFIDENCE_THRESHOLD": "0.70",
+    "INGEST_SCHEDULE": "*/30 * * * * *",
+    "BATCH_MAX_FILES": "20",
+    "BATCH_TIME_BUDGET_SEC": "60"
   }
 }
 EOF
 # terminal B:
 #   cd src && func start
+# (locally we use a 30-second NCRONTAB so you don't wait 15 minutes between
+#  uploads and verification)
 
 # 2) Upload probe JSON (production analyze-result shape)
 TS=$(date +%Y%m%d%H%M%S)
@@ -242,11 +305,11 @@ See [src/README.md](src/README.md).
 │   ├── 02_views.sql            # Power BI views
 │   └── README.md               # post-deploy SQL steps
 └── src/
-    ├── function_app.py         # blob trigger
+    ├── function_app.py         # timer trigger + batch loop + failure handling
     ├── ingestion.py            # JSON -> rows (handles both CU formats, recursive)
-    ├── sql_client.py           # pyodbc + MI
-    ├── storage_client.py       # blob copy + delete (= move)
-    ├── host.json
+    ├── sql_client.py           # pyodbc + MI; usp_UpsertDocument / usp_FinalizeDocument / log_error
+    ├── storage_client.py       # list + 60s lease + server-side copy + delete (= move)
+    ├── host.json               # functionTimeout 00:10:00 (Y1 max)
     ├── requirements.txt
     ├── local.settings.json.sample
     └── README.md

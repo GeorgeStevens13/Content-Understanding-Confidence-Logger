@@ -13,6 +13,10 @@
     "SQL_SERVER": "<your-sql-server>.database.windows.net",
     "SQL_DATABASE": "cu_confidence",
 
-    "LOW_CONFIDENCE_THRESHOLD": "0.70"
+    "LOW_CONFIDENCE_THRESHOLD": "0.70",
+
+    "INGEST_SCHEDULE": "0 */15 * * * *",
+    "BATCH_MAX_FILES": "50",
+    "BATCH_TIME_BUDGET_SEC": "540"
   }
 }

@@ -87,6 +87,13 @@ resource site 'Microsoft.Web/sites@2024-04-01' = {
         { name: 'SQL_DATABASE',                               value: sqlDatabaseName }
         { name: 'LOW_CONFIDENCE_THRESHOLD',                   value: '0.70' }
 
+        // Timer-driven batch ingest (NCRONTAB, UTC). Defaults: every 15 min,
+        // up to 50 files per tick, stop after 9 minutes to stay inside the
+        // 10-minute host timeout.
+        { name: 'INGEST_SCHEDULE',                            value: '0 */15 * * * *' }
+        { name: 'BATCH_MAX_FILES',                            value: '50' }
+        { name: 'BATCH_TIME_BUDGET_SEC',                      value: '540' }
+
         // Let Oryx install Python wheels (pyodbc, azure-identity, etc.) on Kudu side.
         // azd uploads source only; remote build resolves requirements.txt.
         { name: 'SCM_DO_BUILD_DURING_DEPLOYMENT',             value: 'true' }

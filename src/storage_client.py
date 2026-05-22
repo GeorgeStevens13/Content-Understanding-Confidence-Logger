@@ -10,11 +10,14 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Iterator
 from urllib.parse import quote
 
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobClient, BlobServiceClient
+from azure.storage.blob import BlobClient, BlobLeaseClient, BlobServiceClient
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +64,15 @@ def move_blob(
     source_blob: str,
     destination_container: str,
     destination_blob: str | None = None,
+    source_lease_id: str | None = None,
     poll_interval_sec: float = 0.5,
     max_wait_sec: float = 60.0,
 ) -> MoveResult:
-    """Server-side copy then delete the source. Preserves blob path by default."""
+    """Server-side copy then delete the source. Preserves blob path by default.
+
+    If the source blob is currently leased by this worker, pass the lease id as
+    `source_lease_id` so the final `delete_blob` call is authorised.
+    """
 
     dest_blob_name = destination_blob or source_blob
     service = get_service()
@@ -97,7 +105,10 @@ def move_blob(
             )
         time.sleep(poll_interval_sec)
 
-    src_client.delete_blob()
+    if source_lease_id:
+        src_client.delete_blob(lease=source_lease_id)
+    else:
+        src_client.delete_blob()
     log.info("Deleted source %s/%s after successful copy", source_container, source_blob)
 
     return MoveResult(
@@ -123,3 +134,76 @@ def write_text_blob(
         overwrite=True,
         content_settings=ContentSettings(content_type=content_type),
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch-mode helpers (used by the timer-triggered ingestion loop).
+# ---------------------------------------------------------------------------
+
+def list_blob_names(
+    *,
+    container: str,
+    name_starts_with: str | None = None,
+    max_results: int | None = None,
+) -> list[str]:
+    """Return blob names in `container`, optionally filtered by prefix and capped.
+
+    Uses server-side paging via `list_blobs` and stops as soon as `max_results`
+    names have been collected so we don't enumerate huge containers needlessly.
+    """
+    container_client = get_service().get_container_client(container)
+    names: list[str] = []
+    iterator = container_client.list_blobs(name_starts_with=name_starts_with)
+    for blob in iterator:
+        names.append(blob.name)
+        if max_results is not None and len(names) >= max_results:
+            break
+    return names
+
+
+def read_blob_bytes(*, container: str, blob_name: str) -> bytes:
+    """Download a blob's contents as bytes."""
+    client = get_service().get_blob_client(container, blob_name)
+    return client.download_blob().readall()
+
+
+@contextmanager
+def acquire_short_lease(
+    *,
+    container: str,
+    blob_name: str,
+    lease_duration_sec: int = 60,
+) -> Iterator[BlobLeaseClient | None]:
+    """Best-effort exclusive lease on a blob.
+
+    Yields the `BlobLeaseClient` on success, or `None` if the lease could not be
+    acquired (already leased by another worker, blob missing, etc.). Always
+    releases the lease on exit so a failed run doesn't keep blobs locked for
+    the full `lease_duration_sec`.
+
+    A 60-second lease is more than enough for one CU JSON ingest and short
+    enough that a crashed worker won't block the next 15-minute tick.
+    """
+    client = get_service().get_blob_client(container, blob_name)
+    lease: BlobLeaseClient | None = None
+    try:
+        lease = client.acquire_lease(lease_duration=lease_duration_sec)
+    except ResourceNotFoundError:
+        log.info("Blob %s/%s vanished before lease could be taken", container, blob_name)
+        yield None
+        return
+    except HttpResponseError as exc:
+        # 409 LeaseAlreadyPresent => another worker is processing this blob.
+        if getattr(exc, "status_code", None) == 409:
+            log.info("Blob %s/%s already leased; skipping this tick", container, blob_name)
+            yield None
+            return
+        raise
+
+    try:
+        yield lease
+    finally:
+        try:
+            lease.release()
+        except Exception:  # pragma: no cover — lease may already be broken/expired
+            log.debug("Lease release failed for %s/%s (ignored)", container, blob_name)

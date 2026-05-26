@@ -1,15 +1,20 @@
-r"""Generate sample PDFs (and a couple of edge-case files) for testing
-``document_quality_check.py``.
+r"""Generate sample PDFs (and a couple of edge-case files) for end-to-end
+testing of the pre-process quality checker (``src/quality_check.py``).
 
 Run:
     python generate_sample_pdfs.py
     python generate_sample_pdfs.py --out samples --pages-overlimit 301
 
-Then validate every sample:
-    Get-ChildItem samples\*.pdf | ForEach-Object {
-        Write-Host "`n=== $($_.Name) ==="
-        python document_quality_check.py $_.FullName
-    }
+Then exercise the in-process checker against every sample, for example:
+    from pathlib import Path
+    import sys; sys.path.insert(0, "../src")
+    from quality_check import check_document
+    for pdf in Path("samples").glob("*.pdf"):
+        report = check_document(str(pdf))
+        print(pdf.name, "->", report.band, report.score, "passed=", report.passed)
+
+Or upload them to the ``incoming/`` container and let the deployed Function
+app pick them up via the ``PREPROCESS_SCHEDULE`` timer.
 
 Each file is named so the expected result is obvious:
     pass_*  -> checker should report PASSED with no ERROR-severity issues
@@ -333,8 +338,8 @@ def main(argv: list[str] | None = None) -> int:
         size_kb = path.stat().st_size / 1024
         print(f"  {label:<{width}}  {path.name:<40}  {size_kb:8.1f} KB")
 
-    print("\nNext step:")
-    print(f"  python document_quality_check.py \"{out}\\pass_small_text.pdf\"")
+    print("\nNext step — upload to incoming/ and watch the preprocess timer:")
+    print(f"  az storage blob upload-batch -d incoming/demo/generic-doc-analyzer \\\n      -s \"{out}\" --account-name <storage> --auth-mode login")
     return 0
 
 

@@ -70,7 +70,7 @@ module storage 'modules/storage.bicep' = {
     location:    location
     tags:        tags
     accountName: storageAccountName
-    containers:  [ 'source', 'processed', 'failed' ]
+    containers:  [ 'source', 'processed', 'failed', 'incoming', 'rejected', 'processed-raw' ]
   }
 }
 
@@ -111,6 +111,9 @@ output STORAGE_ACCOUNT_NAME       string = storage.outputs.accountName
 output SOURCE_CONTAINER           string = 'source'
 output PROCESSED_CONTAINER        string = 'processed'
 output FAILED_CONTAINER           string = 'failed'
+output INCOMING_CONTAINER         string = 'incoming'
+output REJECTED_CONTAINER         string = 'rejected'
+output PROCESSED_RAW_CONTAINER    string = 'processed-raw'
 
 output FUNCTION_APP_NAME          string = function.outputs.functionAppName
 output FUNCTION_PRINCIPAL_ID      string = function.outputs.principalId

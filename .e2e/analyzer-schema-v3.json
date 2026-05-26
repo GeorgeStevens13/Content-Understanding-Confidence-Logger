@@ -1,0 +1,15 @@
+{
+  "description": "E2E test analyzer for Content Understanding Confidence Logger pipeline.",
+  "baseAnalyzerId": "prebuilt-read",
+  "scenario": "document",
+  "fieldSchema": {
+    "name": "GenericDocument",
+    "fields": {
+      "Title": {
+        "type": "string",
+        "method": "extract",
+        "description": "Title of the document."
+      }
+    }
+  }
+}

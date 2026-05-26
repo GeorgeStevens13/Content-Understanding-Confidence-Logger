@@ -124,6 +124,7 @@ def write_text_blob(
     blob_name: str,
     text: str,
     content_type: str = "text/plain; charset=utf-8",
+    metadata: dict[str, str] | None = None,
 ) -> None:
     """Used to drop a `.error.txt` next to a failed file."""
     from azure.storage.blob import ContentSettings
@@ -133,6 +134,47 @@ def write_text_blob(
         text.encode("utf-8"),
         overwrite=True,
         content_settings=ContentSettings(content_type=content_type),
+        metadata=metadata,
+    )
+
+
+def write_bytes_blob(
+    *,
+    container: str,
+    blob_name: str,
+    data: bytes,
+    content_type: str = "application/octet-stream",
+    metadata: dict[str, str] | None = None,
+) -> str:
+    """Upload raw bytes. Returns the blob URL."""
+    from azure.storage.blob import ContentSettings
+
+    client = get_service().get_blob_client(container, blob_name)
+    client.upload_blob(
+        data,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=content_type),
+        metadata=metadata,
+    )
+    return client.url
+
+
+def write_json_blob(
+    *,
+    container: str,
+    blob_name: str,
+    payload: object,
+    metadata: dict[str, str] | None = None,
+) -> str:
+    """Serialize ``payload`` as JSON and upload it. Returns the blob URL."""
+    import json as _json
+
+    return write_bytes_blob(
+        container=container,
+        blob_name=blob_name,
+        data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        content_type="application/json; charset=utf-8",
+        metadata=metadata,
     )
 
 
@@ -165,6 +207,31 @@ def read_blob_bytes(*, container: str, blob_name: str) -> bytes:
     """Download a blob's contents as bytes."""
     client = get_service().get_blob_client(container, blob_name)
     return client.download_blob().readall()
+
+
+def read_blob_with_metadata(
+    *, container: str, blob_name: str
+) -> tuple[bytes, dict[str, str]]:
+    """Download a blob and return ``(bytes, metadata)``.
+
+    Blob metadata keys are returned lowercased by the service when stored,
+    so callers should look them up case-insensitively.
+    """
+    client = get_service().get_blob_client(container, blob_name)
+    stream = client.download_blob()
+    data = stream.readall()
+    props = client.get_blob_properties()
+    return data, dict(props.metadata or {})
+
+
+def download_blob_to_file(
+    *, container: str, blob_name: str, destination: str
+) -> None:
+    """Stream a blob to a local path. Used to feed the quality checker which
+    operates on file paths (PyMuPDF, Pillow, openpyxl all want a real file)."""
+    client = get_service().get_blob_client(container, blob_name)
+    with open(destination, "wb") as f:
+        client.download_blob().readinto(f)
 
 
 @contextmanager

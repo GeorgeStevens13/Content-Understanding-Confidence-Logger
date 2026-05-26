@@ -1,0 +1,33 @@
+{
+  "description": "E2E test analyzer for Content Understanding Confidence Logger pipeline.",
+  "baseAnalyzerId": "prebuilt-documentAnalyzer",
+  "scenario": "document",
+  "config": {
+    "returnDetails": true
+  },
+  "fieldSchema": {
+    "name": "GenericDocument",
+    "fields": {
+      "Title": {
+        "type": "string",
+        "method": "extract",
+        "description": "Title of the document, typically the first heading or top-of-page text."
+      },
+      "Summary": {
+        "type": "string",
+        "method": "generate",
+        "description": "One-sentence summary of what the document is about."
+      },
+      "PageCount": {
+        "type": "integer",
+        "method": "extract",
+        "description": "Total number of pages in the document."
+      },
+      "Language": {
+        "type": "string",
+        "method": "extract",
+        "description": "Primary language of the document, ISO 639-1 code (e.g. 'en', 'es')."
+      }
+    }
+  }
+}

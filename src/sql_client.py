@@ -7,6 +7,7 @@ pass a password and never need ODBC to know about Entra at all.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import struct
@@ -17,6 +18,7 @@ import pyodbc
 from azure.identity import DefaultAzureCredential
 
 from ingestion import FieldRow, ParsedDocument
+from quality_check import QualityReport
 
 log = logging.getLogger(__name__)
 
@@ -222,3 +224,144 @@ def _bulk_insert_fields(cur: pyodbc.Cursor, document_id: int, rows: Iterable[Fie
             for r in rows
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-process quality check persistence
+# ---------------------------------------------------------------------------
+
+def write_preprocess_check(
+    report: QualityReport,
+    *,
+    usecase: str,
+    analyzer_name: str,
+    blob_path: str,
+    file_name: str,
+) -> int:
+    """Insert one PreProcessChecks row + all its issue rows in a single transaction.
+
+    Returns the new ``check_id``. The caller uses this id later to
+    (a) update the CU submission outcome via :func:`update_preprocess_cu_outcome`
+    and (b) back-link the resulting ``cu.Documents`` row via
+    :func:`set_document_preprocess_check_id`.
+    """
+    with connect() as conn:
+        conn.autocommit = False
+        try:
+            cur = conn.cursor()
+
+            check_id = cur.execute(
+                """
+                DECLARE @id BIGINT;
+                EXEC cu.usp_InsertPreProcessCheck
+                    @blob_path       = ?,
+                    @usecase         = ?,
+                    @analyzer_name   = ?,
+                    @file_name       = ?,
+                    @extension       = ?,
+                    @detected_kind   = ?,
+                    @file_size_bytes = ?,
+                    @mode            = ?,
+                    @passed          = ?,
+                    @score           = ?,
+                    @band            = ?,
+                    @error_count     = ?,
+                    @warning_count   = ?,
+                    @info_count      = ?,
+                    @metadata_json   = ?,
+                    @check_id        = @id OUTPUT;
+                SELECT @id;
+                """,
+                blob_path,
+                usecase,
+                analyzer_name,
+                file_name,
+                report.extension,
+                report.detected_kind,
+                report.file_size_bytes,
+                report.mode,
+                1 if report.passed else 0,
+                report.score,
+                report.band,
+                report.error_count,
+                report.warning_count,
+                report.info_count,
+                json.dumps(report.metadata, default=str) if report.metadata else None,
+            ).fetchval()
+
+            check_id = int(check_id)
+
+            if report.issues:
+                cur.fast_executemany = True
+                cur.executemany(
+                    """
+                    INSERT INTO cu.PreProcessIssues
+                        (check_id, code, severity, message, details_json)
+                    VALUES (?, ?, ?, ?, ?);
+                    """,
+                    [
+                        (
+                            check_id,
+                            issue.code,
+                            issue.severity.value,
+                            issue.message[:2000],
+                            json.dumps(issue.details, default=str) if issue.details else None,
+                        )
+                        for issue in report.issues
+                    ],
+                )
+
+            conn.commit()
+            log.info(
+                "Inserted PreProcessChecks check_id=%s for %s (passed=%s score=%d issues=%d)",
+                check_id, blob_path, report.passed, report.score, len(report.issues),
+            )
+            return check_id
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def update_preprocess_cu_outcome(
+    check_id: int,
+    *,
+    submitted_to_cu: bool,
+    cu_status: str | None = None,
+    cu_operation_location: str | None = None,
+    cu_error_message: str | None = None,
+    routed_to_blob_path: str | None = None,
+    cu_result_blob_path: str | None = None,
+) -> None:
+    """Patch the CU submission columns on a PreProcessChecks row."""
+    with connect() as conn:
+        conn.execute(
+            """
+            EXEC cu.usp_UpdatePreProcessCuOutcome
+                @check_id              = ?,
+                @submitted_to_cu       = ?,
+                @cu_operation_location = ?,
+                @cu_status             = ?,
+                @cu_error_message      = ?,
+                @routed_to_blob_path   = ?,
+                @cu_result_blob_path   = ?;
+            """,
+            check_id,
+            1 if submitted_to_cu else 0,
+            cu_operation_location,
+            cu_status,
+            cu_error_message[:4000] if cu_error_message else None,
+            routed_to_blob_path,
+            cu_result_blob_path,
+        )
+        conn.commit()
+
+
+def set_document_preprocess_check_id(document_id: int, check_id: int) -> None:
+    """Back-link the ingested document to its originating quality check."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE cu.Documents SET preprocess_check_id = ? WHERE document_id = ?;",
+            check_id,
+            document_id,
+        )
+        conn.commit()

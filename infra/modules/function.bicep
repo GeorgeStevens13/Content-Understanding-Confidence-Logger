@@ -83,6 +83,9 @@ resource site 'Microsoft.Web/sites@2024-04-01' = {
         { name: 'SOURCE_CONTAINER',                           value: 'source' }
         { name: 'PROCESSED_CONTAINER',                        value: 'processed' }
         { name: 'FAILED_CONTAINER',                           value: 'failed' }
+        { name: 'INCOMING_CONTAINER',                         value: 'incoming' }
+        { name: 'REJECTED_CONTAINER',                         value: 'rejected' }
+        { name: 'PROCESSED_RAW_CONTAINER',                    value: 'processed-raw' }
         { name: 'SQL_SERVER',                                 value: sqlServerFqdn }
         { name: 'SQL_DATABASE',                               value: sqlDatabaseName }
         { name: 'LOW_CONFIDENCE_THRESHOLD',                   value: '0.70' }
@@ -93,6 +96,22 @@ resource site 'Microsoft.Web/sites@2024-04-01' = {
         { name: 'INGEST_SCHEDULE',                            value: '0 */15 * * * *' }
         { name: 'BATCH_MAX_FILES',                            value: '50' }
         { name: 'BATCH_TIME_BUDGET_SEC',                      value: '540' }
+
+        // Pre-processing + Content Understanding submission loop.
+        //   * PREPROCESS_MODE   = standard | pro (slower, deeper checks).
+        //   * PREPROCESS_STRICT = if 'true', WARNING-level issues also reject.
+        //   * CU_ENDPOINT must be filled in after deployment, e.g.
+        //       az functionapp config appsettings set -g <rg> -n <app> \
+        //         --settings CU_ENDPOINT=https://<aiservices>.cognitiveservices.azure.com
+        //     The function's MI must also be granted the 'Cognitive Services User'
+        //     role on the Content Understanding (Azure AI Services) resource.
+        { name: 'PREPROCESS_SCHEDULE',                        value: '0 */15 * * * *' }
+        { name: 'PREPROCESS_BATCH_MAX_FILES',                 value: '20' }
+        { name: 'PREPROCESS_TIME_BUDGET_SEC',                 value: '540' }
+        { name: 'PREPROCESS_MODE',                            value: 'standard' }
+        { name: 'PREPROCESS_STRICT',                          value: 'false' }
+        { name: 'CU_ENDPOINT',                                value: '' }
+        { name: 'CU_API_VERSION',                             value: '2024-12-01-preview' }
 
         // Let Oryx install Python wheels (pyodbc, azure-identity, etc.) on Kudu side.
         // azd uploads source only; remote build resolves requirements.txt.

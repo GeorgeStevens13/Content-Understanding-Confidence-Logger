@@ -180,3 +180,176 @@ BEGIN
      WHERE d.document_id = @document_id;
 END
 GO
+
+-- =============================================================================
+-- Pre-processing quality check (run BEFORE the doc is sent to Content
+-- Understanding). One row per raw incoming document, plus 0..N issue rows.
+-- The Function App writes one PreProcessChecks row, then 0..N PreProcessIssues
+-- rows for ERROR/WARNING/INFO findings. If the document passes, it is
+-- submitted to CU and the resulting cu.Documents row is back-linked via
+-- cu.Documents.preprocess_check_id.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- PreProcessChecks — header row per inspected file.
+-- ---------------------------------------------------------------------------
+IF OBJECT_ID('cu.PreProcessChecks', 'U') IS NULL
+BEGIN
+    CREATE TABLE cu.PreProcessChecks
+    (
+        check_id              BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_PreProcessChecks PRIMARY KEY,
+        blob_path             NVARCHAR(1024) NOT NULL,                -- incoming/<usecase>/<analyzer>/<file>.<ext>
+        usecase               NVARCHAR(128)  NOT NULL,
+        analyzer_name         NVARCHAR(256)  NOT NULL,
+        file_name             NVARCHAR(512)  NOT NULL,
+        extension             NVARCHAR(16)   NOT NULL,
+        detected_kind         NVARCHAR(16)   NOT NULL,                -- pdf|image|office|text|unknown
+        file_size_bytes       BIGINT         NOT NULL,
+        mode                  NVARCHAR(16)   NOT NULL,                -- standard|pro
+        passed                BIT            NOT NULL,
+        score                 INT            NOT NULL,
+        band                  NVARCHAR(16)   NOT NULL,                -- excellent|good|fair|poor|unusable
+        error_count           INT            NOT NULL,
+        warning_count         INT            NOT NULL,
+        info_count            INT            NOT NULL,
+        metadata_json         NVARCHAR(MAX)  NULL,
+        -- Routing + CU submission outcome (filled after the check completes)
+        submitted_to_cu       BIT            NOT NULL CONSTRAINT DF_PreProcessChecks_Submitted DEFAULT(0),
+        cu_operation_location NVARCHAR(1024) NULL,
+        cu_status             NVARCHAR(32)   NULL,                    -- Succeeded|Failed|Timeout|Skipped
+        cu_error_message      NVARCHAR(4000) NULL,
+        routed_to_blob_path   NVARCHAR(1024) NULL,                    -- where the raw doc ended up
+        cu_result_blob_path   NVARCHAR(1024) NULL,                    -- source/<usecase>/<analyzer>/<stem>.json
+        checked_at            DATETIME2(3)   NOT NULL CONSTRAINT DF_PreProcessChecks_CheckedAt DEFAULT(SYSUTCDATETIME()),
+        completed_at          DATETIME2(3)   NULL
+    );
+
+    CREATE INDEX IX_PreProcessChecks_BlobPath
+        ON cu.PreProcessChecks (blob_path);
+    CREATE INDEX IX_PreProcessChecks_Usecase_Analyzer
+        ON cu.PreProcessChecks (usecase, analyzer_name)
+        INCLUDE (passed, score, checked_at);
+    CREATE INDEX IX_PreProcessChecks_CheckedAt
+        ON cu.PreProcessChecks (checked_at DESC);
+END
+GO
+
+-- ---------------------------------------------------------------------------
+-- PreProcessIssues — one row per ERROR/WARNING/INFO finding from the checker.
+-- ---------------------------------------------------------------------------
+IF OBJECT_ID('cu.PreProcessIssues', 'U') IS NULL
+BEGIN
+    CREATE TABLE cu.PreProcessIssues
+    (
+        issue_id      BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_PreProcessIssues PRIMARY KEY,
+        check_id      BIGINT         NOT NULL,
+        code          NVARCHAR(64)   NOT NULL,                      -- e.g. PDF_TOO_MANY_PAGES
+        severity      NVARCHAR(16)   NOT NULL,                      -- ERROR|WARNING|INFO
+        message       NVARCHAR(2000) NOT NULL,
+        details_json  NVARCHAR(MAX)  NULL,
+        CONSTRAINT FK_PreProcessIssues_Checks
+            FOREIGN KEY (check_id) REFERENCES cu.PreProcessChecks(check_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IX_PreProcessIssues_CheckId
+        ON cu.PreProcessIssues (check_id);
+    CREATE INDEX IX_PreProcessIssues_Code
+        ON cu.PreProcessIssues (code)
+        INCLUDE (severity);
+END
+GO
+
+-- ---------------------------------------------------------------------------
+-- Back-link cu.Documents -> cu.PreProcessChecks (one quality check can
+-- produce one CU document). NULL for docs ingested before this column existed.
+-- ---------------------------------------------------------------------------
+IF COL_LENGTH('cu.Documents', 'preprocess_check_id') IS NULL
+BEGIN
+    ALTER TABLE cu.Documents
+        ADD preprocess_check_id BIGINT NULL
+            CONSTRAINT FK_Documents_PreProcessChecks
+                REFERENCES cu.PreProcessChecks(check_id);
+END
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+     WHERE name = 'IX_Documents_PreProcessCheckId'
+       AND object_id = OBJECT_ID('cu.Documents')
+)
+    CREATE INDEX IX_Documents_PreProcessCheckId
+        ON cu.Documents (preprocess_check_id)
+        WHERE preprocess_check_id IS NOT NULL;
+GO
+
+-- ---------------------------------------------------------------------------
+-- usp_InsertPreProcessCheck — single-trip header insert.
+-- The app calls this once per file, then INSERTs the issue rows in a single
+-- batch via executemany, then (after CU is called) calls usp_UpdatePreProcessCuOutcome.
+-- ---------------------------------------------------------------------------
+IF OBJECT_ID('cu.usp_InsertPreProcessCheck', 'P') IS NOT NULL DROP PROCEDURE cu.usp_InsertPreProcessCheck;
+GO
+CREATE PROCEDURE cu.usp_InsertPreProcessCheck
+    @blob_path        NVARCHAR(1024),
+    @usecase          NVARCHAR(128),
+    @analyzer_name    NVARCHAR(256),
+    @file_name        NVARCHAR(512),
+    @extension        NVARCHAR(16),
+    @detected_kind    NVARCHAR(16),
+    @file_size_bytes  BIGINT,
+    @mode             NVARCHAR(16),
+    @passed           BIT,
+    @score            INT,
+    @band             NVARCHAR(16),
+    @error_count      INT,
+    @warning_count    INT,
+    @info_count       INT,
+    @metadata_json    NVARCHAR(MAX) = NULL,
+    @check_id         BIGINT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    INSERT INTO cu.PreProcessChecks
+        (blob_path, usecase, analyzer_name, file_name, extension, detected_kind,
+         file_size_bytes, mode, passed, score, band,
+         error_count, warning_count, info_count, metadata_json)
+    VALUES
+        (@blob_path, @usecase, @analyzer_name, @file_name, @extension, @detected_kind,
+         @file_size_bytes, @mode, @passed, @score, @band,
+         @error_count, @warning_count, @info_count, @metadata_json);
+
+    SET @check_id = SCOPE_IDENTITY();
+END
+GO
+
+-- ---------------------------------------------------------------------------
+-- usp_UpdatePreProcessCuOutcome — patch the routing / CU result columns once
+-- the document has been routed (rejected, submitted to CU, or CU completed).
+-- ---------------------------------------------------------------------------
+IF OBJECT_ID('cu.usp_UpdatePreProcessCuOutcome', 'P') IS NOT NULL DROP PROCEDURE cu.usp_UpdatePreProcessCuOutcome;
+GO
+CREATE PROCEDURE cu.usp_UpdatePreProcessCuOutcome
+    @check_id              BIGINT,
+    @submitted_to_cu       BIT             = 0,
+    @cu_operation_location NVARCHAR(1024)  = NULL,
+    @cu_status             NVARCHAR(32)    = NULL,
+    @cu_error_message      NVARCHAR(4000)  = NULL,
+    @routed_to_blob_path   NVARCHAR(1024)  = NULL,
+    @cu_result_blob_path   NVARCHAR(1024)  = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE cu.PreProcessChecks
+       SET submitted_to_cu       = @submitted_to_cu,
+           cu_operation_location = COALESCE(@cu_operation_location, cu_operation_location),
+           cu_status             = COALESCE(@cu_status,             cu_status),
+           cu_error_message      = COALESCE(@cu_error_message,      cu_error_message),
+           routed_to_blob_path   = COALESCE(@routed_to_blob_path,   routed_to_blob_path),
+           cu_result_blob_path   = COALESCE(@cu_result_blob_path,   cu_result_blob_path),
+           completed_at          = SYSUTCDATETIME()
+     WHERE check_id = @check_id;
+END
+GO

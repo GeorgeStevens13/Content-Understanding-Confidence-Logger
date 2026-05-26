@@ -1,32 +1,59 @@
 # Content Understanding Confidence Logger
 
-Ingest Azure AI **Content Understanding** label/extraction JSON into **Azure SQL** so every
-extracted field (and its confidence score) is queryable and reportable from **Power BI**.
-Originals are moved from a `source` container to `processed` (or `failed`) once handled.
+End-to-end pipeline for **Azure AI Content Understanding** with built-in
+**document quality gating** and confidence logging into **Azure SQL** for
+**Power BI** reporting.
 
-Processing is **timer-driven**: every 15 minutes (configurable via `INGEST_SCHEDULE`)
-the Function App scans the `source` container and processes up to `BATCH_MAX_FILES`
-blobs in a single batch.
+Two **timer-driven** Azure Function loops cover the full flow:
+
+1. **Pre-process & extract** — picks raw uploads from the `incoming` container,
+   runs a local quality checker, persists the result, and only **passing**
+   documents are submitted to Content Understanding. Rejected docs are routed
+   to `rejected/` with a JSON report next to them. Successful CU results are
+   written to the `source/` container, stamped with metadata that back-links
+   them to the originating quality check row.
+2. **Ingest** — picks CU result JSON from `source/`, flattens every extracted
+   field and confidence into `cu.Documents` / `cu.DocumentFields`, back-links
+   to the originating `cu.PreProcessChecks` row, and moves the JSON to
+   `processed/`.
 
 ```mermaid
 flowchart LR
-    T["Timer<br/>(INGEST_SCHEDULE, default every 15 min UTC)"] --> B
-    A["Blob Storage<br/>source/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json"] -->|List + 60s lease| B
-    B["Azure Function App<br/>Python 3.11 · Managed Identity<br/>batch up to BATCH_MAX_FILES per tick"]
-    B -->|Parse + flatten fields<br/>upsert via cu.usp_UpsertDocument| C[("Azure SQL<br/>cu.Documents · cu.DocumentFields")]
+    T1["Timer<br/>(PREPROCESS_SCHEDULE)"] --> P
+    U["Upload raw doc<br/>(PDF, image, .docx, .xlsx, ...)"] --> I
+    I["Blob Storage<br/>incoming/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.&lt;ext&gt;"] -->|List + lease| P
+    P["Pre-process & extract<br/>(quality_check + cu_client)"]
+    P -->|Insert| PC[("cu.PreProcessChecks<br/>+ cu.PreProcessIssues")]
+    P -->|FAIL| R["rejected/<br/>+ .report.json sidecar"]
+    P -->|PASS · POST to CU REST| CU["Azure AI<br/>Content Understanding"]
+    CU -->|Result JSON| S["source/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;stem&gt;.json<br/>metadata: preprocesscheckid"]
+    P -->|PASS · move raw| PR["processed-raw/"]
+
+    T2["Timer<br/>(INGEST_SCHEDULE)"] --> B
+    S -->|List + lease| B
+    B["Ingest batch<br/>(ingestion.parse + sql_client)"]
+    B -->|Flatten fields<br/>+ back-link preprocess_check_id| C[("Azure SQL<br/>cu.Documents · cu.DocumentFields")]
+    PC -.->|preprocess_check_id| C
     C --> D["Power BI<br/>cu.vw_* views"]
     B -->|On success| E["processed/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json"]
-    B -->|On failure| F["failed/&lt;usecase&gt;/&lt;analyzer&gt;/&lt;file&gt;.json<br/>+ .error.txt sidecar<br/>+ row in cu.IngestionErrors"]
+    B -->|On failure| F["failed/<br/>+ .error.txt sidecar<br/>+ row in cu.IngestionErrors"]
 ```
+
+> **Drop in at any stage.** If you already have CU output JSON, upload it
+> straight to `source/<usecase>/<analyzer>/<file>.json` and the ingest loop
+> will pick it up — the pre-process loop is a separate optional front-end.
 
 ## What gets stored
 
 For every JSON file ingested:
 
-| Table              | Purpose                                                                 |
-| ------------------ | ----------------------------------------------------------------------- |
-| `cu.Documents`     | One row per document — usecase, analyzer, filename, blob path, mime, …  |
-| `cu.DocumentFields` | One row per extracted field — field name, value, **confidence**, spans |
+| Table                   | Purpose                                                                          |
+| ----------------------- | -------------------------------------------------------------------------------- |
+| `cu.Documents`          | One row per document — usecase, analyzer, filename, blob path, mime, …           |
+| `cu.DocumentFields`     | One row per extracted field — field name, value, **confidence**, spans          |
+| `cu.PreProcessChecks`   | One row per quality check — score, band, pass/fail, CU submission outcome       |
+| `cu.PreProcessIssues`   | One row per detected issue — code, severity, message, optional JSON details     |
+| `cu.IngestionErrors`    | One row per failed ingest / CU submission                                       |
 
 Re-ingesting the same blob path **upserts** (replaces) — safe to replay.
 
@@ -49,13 +76,17 @@ otherwise the filename is used.
 Connect Power BI Desktop → **Azure SQL Database** → enter the server name & DB →
 authenticate (Microsoft account / Entra ID). Pick from these views:
 
-| View                         | Use                                                            |
-| ---------------------------- | -------------------------------------------------------------- |
-| `cu.vw_DocumentFields`       | Flat fact table — one row per field. Main reporting surface.   |
-| `cu.vw_DocumentSummary`      | One row per document — avg/min/max confidence, field count.    |
-| `cu.vw_LowConfidenceFields`  | Fields below `LOW_CONFIDENCE_THRESHOLD` (default 0.7).         |
-| `cu.vw_FieldStatsByAnalyzer` | Per-analyzer / per-field-name confidence stats over time.      |
-| `cu.vw_DailyIngestion`       | Daily volume + average confidence + error count.               |
+| View                            | Use                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------- |
+| `cu.vw_DocumentFields`          | Flat fact table — one row per field. Main reporting surface.              |
+| `cu.vw_DocumentSummary`         | One row per document — avg/min/max confidence, field count.               |
+| `cu.vw_LowConfidenceFields`     | Fields below `LOW_CONFIDENCE_THRESHOLD` (default 0.7).                    |
+| `cu.vw_FieldStatsByAnalyzer`    | Per-analyzer / per-field-name confidence stats over time.                 |
+| `cu.vw_DailyIngestion`          | Daily volume + average confidence + error count.                          |
+| `cu.vw_PreProcessChecks`        | Per-document quality check + CU submission outcome.                       |
+| `cu.vw_PreProcessIssues`        | Every issue raised by `quality_check.py` (with severity + code).          |
+| `cu.vw_RejectedDocuments`       | Quality-rejected docs (never reached CU).                                 |
+| `cu.vw_PreProcessDailySummary`  | Daily pre-process volume + pass/fail rate.                                |
 
 ## Deploy
 
@@ -69,13 +100,43 @@ azd up
 
 `azd up` will:
 
-1. Provision storage (with `source`, `processed`, `failed` containers), Azure SQL
-   (Entra-only auth, **you** become the SQL admin), App Insights, and a Linux
-   Consumption Python Function App.
+1. Provision storage (with `source`, `processed`, `failed`, `incoming`,
+   `rejected`, `processed-raw` containers), Azure SQL (Entra-only auth,
+   **you** become the SQL admin), App Insights, and a Linux Consumption
+   Python Function App.
 2. Grant the Function App's Managed Identity `Storage Blob Data Owner`,
    `Storage Queue Data Contributor`, and `Storage Table Data Contributor`
    on the storage account (required for identity-based `AzureWebJobsStorage`).
 3. Build and deploy the Python function code.
+
+### Wire up Content Understanding (required for the preprocess loop)
+
+The pre-process loop submits passing documents to Azure AI Content Understanding
+over its REST API using the Function App's Managed Identity. Two one-time
+steps are required:
+
+```bash
+RG=rg-dev
+FUNC=func-cuc-dev-xxxxxxxx
+AI=<your-ai-services-resource-name>   # an Azure AI Services / Cognitive Services account
+
+# 1) Tell the Function App where CU lives.
+ENDPOINT=$(az cognitiveservices account show -g $RG -n $AI --query properties.endpoint -o tsv)
+az functionapp config appsettings set -g $RG -n $FUNC \
+  --settings CU_ENDPOINT=$ENDPOINT
+
+# 2) Grant the Function MI 'Cognitive Services User' on the CU resource.
+FUNC_MI=$(az functionapp identity show -g $RG -n $FUNC --query principalId -o tsv)
+AI_ID=$(az cognitiveservices account show -g $RG -n $AI --query id -o tsv)
+az role assignment create --assignee-object-id $FUNC_MI \
+  --assignee-principal-type ServicePrincipal \
+  --role "Cognitive Services User" --scope $AI_ID
+```
+
+The CU analyzer ID is taken from the **second** path segment of each incoming
+blob, e.g. `incoming/invoices/contoso-invoice-v3/sample.pdf` is submitted to
+analyzer `contoso-invoice-v3`. Make sure the analyzer exists on the CU
+resource before uploading.
 
 ### Python package gotcha (Linux Y1 Consumption)
 
@@ -116,24 +177,41 @@ Two SQL steps are needed once (Azure can't fully automate Entra DB users via Bic
 
 Full T-SQL and instructions: [sql/README.md](sql/README.md).
 
-After that, drop one or more JSON files into:
+After that, drop one or more **raw documents** into:
+
+```
+<storage>/incoming/<usecase>/<analyzer>/<file>.<ext>     (PDF, image, .docx, .xlsx, .pptx, .txt)
+```
+
+On the next pre-process tick the file is quality-checked. If it passes, the
+Function App calls Content Understanding, writes the result JSON to
+`source/<usecase>/<analyzer>/<file>.json`, and moves the raw doc to
+`processed-raw/`. The ingest loop then flattens the JSON into
+`cu.Documents` + `cu.DocumentFields` and moves it to `processed/`.
+
+If you already have CU output JSON (e.g. from `cu_curl_test.sh` or another
+pipeline), drop it directly into:
 
 ```
 <storage>/source/<usecase>/<analyzer>/<file>.json
 ```
 
-They will be picked up on the next 15-minute timer tick (or sooner if you set
-`INGEST_SCHEDULE` to a tighter NCRONTAB expression), inserted into
-`cu.Documents` + `cu.DocumentFields`, and moved to
-`<storage>/processed/<usecase>/<analyzer>/<file>.json`.
+The ingest loop will pick it up on the next tick.
 
-### Ingest schedule
+### Schedules & batch tuning
 
-| Setting                  | Default          | Notes                                                                                  |
-| ------------------------ | ---------------- | -------------------------------------------------------------------------------------- |
-| `INGEST_SCHEDULE`        | `0 */15 * * * *` | NCRONTAB (UTC). Top of the hour + every 15 min. Use `0 */5 * * * *` for 5-min cadence. |
-| `BATCH_MAX_FILES`        | `50`             | Max blobs processed per tick. Anything not consumed waits for the next tick.           |
-| `BATCH_TIME_BUDGET_SEC`  | `540`            | Soft cutoff (9 min) so the loop never bumps into the 10-min host timeout.              |
+| Setting                       | Default          | Notes                                                                                  |
+| ----------------------------- | ---------------- | -------------------------------------------------------------------------------------- |
+| `INGEST_SCHEDULE`             | `0 */15 * * * *` | NCRONTAB (UTC). Top of the hour + every 15 min. Use `0 */5 * * * *` for 5-min cadence. |
+| `BATCH_MAX_FILES`             | `50`             | Max CU-result JSON blobs processed per ingest tick.                                    |
+| `BATCH_TIME_BUDGET_SEC`       | `540`            | Soft cutoff (9 min) so the loop never bumps into the 10-min host timeout.              |
+| `PREPROCESS_SCHEDULE`         | `0 */15 * * * *` | NCRONTAB (UTC) for the pre-process + CU submission loop.                               |
+| `PREPROCESS_BATCH_MAX_FILES`  | `20`             | Max raw docs processed per pre-process tick. Each one may call CU + poll.              |
+| `PREPROCESS_TIME_BUDGET_SEC`  | `540`            | Soft cutoff for the pre-process loop.                                                  |
+| `PREPROCESS_MODE`             | `standard`       | `standard` or `pro`. Pro runs slower / deeper image quality heuristics.                |
+| `PREPROCESS_STRICT`           | `false`          | If `true`, WARNING-level issues also reject the document.                              |
+| `CU_ENDPOINT`                 | _(empty)_        | **Must be set.** e.g. `https://<resource>.cognitiveservices.azure.com`.                |
+| `CU_API_VERSION`              | `2024-12-01-preview` | Content Understanding REST API version.                                            |
 
 Change them with `az functionapp config appsettings set` (no redeploy needed).
 

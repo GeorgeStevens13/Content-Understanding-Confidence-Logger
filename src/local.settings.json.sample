@@ -9,6 +9,9 @@
     "SOURCE_CONTAINER": "source",
     "PROCESSED_CONTAINER": "processed",
     "FAILED_CONTAINER": "failed",
+    "INCOMING_CONTAINER": "incoming",
+    "REJECTED_CONTAINER": "rejected",
+    "PROCESSED_RAW_CONTAINER": "processed-raw",
 
     "SQL_SERVER": "<your-sql-server>.database.windows.net",
     "SQL_DATABASE": "cu_confidence",
@@ -17,6 +20,15 @@
 
     "INGEST_SCHEDULE": "0 */15 * * * *",
     "BATCH_MAX_FILES": "50",
-    "BATCH_TIME_BUDGET_SEC": "540"
+    "BATCH_TIME_BUDGET_SEC": "540",
+
+    "PREPROCESS_SCHEDULE": "*/30 * * * * *",
+    "PREPROCESS_BATCH_MAX_FILES": "10",
+    "PREPROCESS_TIME_BUDGET_SEC": "540",
+    "PREPROCESS_MODE": "standard",
+    "PREPROCESS_STRICT": "false",
+
+    "CU_ENDPOINT": "https://<your-ai-services>.cognitiveservices.azure.com",
+    "CU_API_VERSION": "2024-12-01-preview"
   }
 }

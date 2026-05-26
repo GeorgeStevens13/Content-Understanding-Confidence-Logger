@@ -145,3 +145,123 @@ SELECT
 FROM cu.Documents d
 GROUP BY CAST(d.ingested_at AS DATE), d.usecase, d.analyzer_name;
 GO
+
+-- ---------------------------------------------------------------------------
+-- vw_PreProcessChecks
+-- Flat view of all quality checks. One row per inspected raw document, with
+-- pass/fail, score, CU submission outcome, and (when CU succeeded) the
+-- extracted document_id + average confidence.
+-- ---------------------------------------------------------------------------
+CREATE OR ALTER VIEW cu.vw_PreProcessChecks
+AS
+SELECT
+    c.check_id,
+    c.blob_path,
+    c.usecase,
+    c.analyzer_name,
+    c.file_name,
+    c.extension,
+    c.detected_kind,
+    c.file_size_bytes,
+    c.mode,
+    c.passed,
+    c.score,
+    c.band,
+    c.error_count,
+    c.warning_count,
+    c.info_count,
+    c.submitted_to_cu,
+    c.cu_status,
+    c.cu_operation_location,
+    c.cu_error_message,
+    c.routed_to_blob_path,
+    c.cu_result_blob_path,
+    c.checked_at,
+    c.completed_at,
+    CAST(c.checked_at AS DATE) AS checked_date,
+    d.document_id,
+    d.field_count       AS extracted_field_count,
+    d.avg_confidence    AS extracted_avg_confidence,
+    d.min_confidence    AS extracted_min_confidence
+FROM cu.PreProcessChecks c
+LEFT JOIN cu.Documents d ON d.preprocess_check_id = c.check_id;
+GO
+
+-- ---------------------------------------------------------------------------
+-- vw_PreProcessIssues
+-- Flat issue feed. One row per ERROR/WARNING/INFO finding, joined with the
+-- parent check so Power BI can slice on usecase/analyzer/file.
+-- ---------------------------------------------------------------------------
+CREATE OR ALTER VIEW cu.vw_PreProcessIssues
+AS
+SELECT
+    i.issue_id,
+    i.check_id,
+    c.blob_path,
+    c.usecase,
+    c.analyzer_name,
+    c.file_name,
+    c.detected_kind,
+    c.mode,
+    c.passed       AS check_passed,
+    c.score        AS check_score,
+    c.band         AS check_band,
+    i.code,
+    i.severity,
+    i.message,
+    i.details_json,
+    c.checked_at,
+    CAST(c.checked_at AS DATE) AS checked_date
+FROM cu.PreProcessIssues i
+JOIN cu.PreProcessChecks  c ON c.check_id = i.check_id;
+GO
+
+-- ---------------------------------------------------------------------------
+-- vw_RejectedDocuments
+-- Review queue: every raw document that the quality checker REJECTED before
+-- being sent to Content Understanding.
+-- ---------------------------------------------------------------------------
+CREATE OR ALTER VIEW cu.vw_RejectedDocuments
+AS
+SELECT
+    c.check_id,
+    c.blob_path,
+    c.routed_to_blob_path,
+    c.usecase,
+    c.analyzer_name,
+    c.file_name,
+    c.extension,
+    c.detected_kind,
+    c.file_size_bytes,
+    c.score,
+    c.band,
+    c.error_count,
+    c.warning_count,
+    c.metadata_json,
+    c.checked_at
+FROM cu.PreProcessChecks c
+WHERE c.passed = 0;
+GO
+
+-- ---------------------------------------------------------------------------
+-- vw_PreProcessDailySummary
+-- Daily roll-up: how many docs were inspected, how many passed, how many
+-- made it through CU, average quality score, top issue code.
+-- ---------------------------------------------------------------------------
+CREATE OR ALTER VIEW cu.vw_PreProcessDailySummary
+AS
+SELECT
+    CAST(c.checked_at AS DATE)                                                   AS checked_date,
+    c.usecase,
+    c.analyzer_name,
+    COUNT(*)                                                                     AS total_inspected,
+    SUM(CASE WHEN c.passed = 1 THEN 1 ELSE 0 END)                                AS passed_count,
+    SUM(CASE WHEN c.passed = 0 THEN 1 ELSE 0 END)                                AS rejected_count,
+    SUM(CASE WHEN c.cu_status = N'Succeeded' THEN 1 ELSE 0 END)                  AS cu_succeeded_count,
+    SUM(CASE WHEN c.cu_status IN (N'Failed', N'Timeout') THEN 1 ELSE 0 END)      AS cu_failed_count,
+    AVG(CAST(c.score AS FLOAT))                                                  AS avg_quality_score,
+    SUM(c.error_count)                                                           AS total_errors,
+    SUM(c.warning_count)                                                         AS total_warnings
+FROM cu.PreProcessChecks c
+GROUP BY CAST(c.checked_at AS DATE), c.usecase, c.analyzer_name;
+GO

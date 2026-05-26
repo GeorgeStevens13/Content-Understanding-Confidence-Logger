@@ -85,11 +85,16 @@ Both scripts are idempotent — safe to re-run after changes.
 3. Auth: **Microsoft account** (Entra ID) — make sure your account has at
    least `db_datareader` on the DB.
 4. Pick the views you want:
-   - `cu.vw_DocumentFields` — main fact table
+   - `cu.vw_DocumentFields` — main fact table (one row per extracted field)
    - `cu.vw_DocumentSummary` — one row per document
-   - `cu.vw_LowConfidenceFields` — review queue
+   - `cu.vw_LowConfidenceFields` — review queue (below `LOW_CONFIDENCE_THRESHOLD`)
    - `cu.vw_FieldStatsByAnalyzer` — field/analyzer trending
    - `cu.vw_DailyIngestion` — daily volume + quality
+   - `cu.vw_PreProcessChecks` — quality-check rollup per document, including
+     CU submission outcome and link back to the resulting `cu.Documents` row
+   - `cu.vw_PreProcessIssues` — every issue raised by `quality_check.py`
+   - `cu.vw_RejectedDocuments` — quality-rejected docs (never reached CU)
+   - `cu.vw_PreProcessDailySummary` — daily pre-process volume + pass/fail rate
 
 ## 4. Inspecting ingestion failures
 
